@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "panner-mcp"
+version = "2.0.0"
+description = "PANNER local MCP server for auditable citation screening"
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Honghao Lai", email = "enenlhh@outlook.com" }]
+keywords = ["systematic-review", "screening", "mcp", "citations", "evidence-synthesis"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "bib-dedupe==0.11.0",
+    "httpx>=0.28.1",
+    "mcp>=2.2,<2.3",
+    "openpyxl>=3.1.5",
+    "pandas>=2.2.3,<3",
+]
+
+[project.scripts]
+panner-mcp = "panner_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/panner_mcp"]
