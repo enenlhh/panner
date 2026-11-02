@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .evaluate import evaluate_rules
-from .screening import _resolve_file
+from .calibration_binding import verify_frozen_calibration
+from .screening import _inputs_are_current, _resolve_file
 from .workspace import sha256_file, workspace_state
 
 EXPORTS = ("screening-report.xlsx", "screening-retained.ris", "screening-excluded.ris")
@@ -64,7 +65,16 @@ def _load_runs(workspace_path: str, results_path: str | None) -> tuple[Path, lis
     if manifest.get("protocol_manifest_sha256") != sha256_file(protocol_file.parent / "manifest.json"):
         raise ValueError("protocol manifest differs from the screening manifest")
     protocol = json.loads(protocol_file.read_text(encoding="utf-8"))
-    return workspace, results, judgments, manifest, {"pool": pool, "protocol": protocol, "results_file": results_file}
+    verify_frozen_calibration(protocol_file, protocol,
+                              json.loads((protocol_file.parent / "manifest.json").read_text(encoding="utf-8")))
+    is_current = bool(state.get("active_screening")
+        and (workspace / state["active_screening"]).resolve() == results_file
+        and _inputs_are_current(workspace, state, protocol_file, pool_file, protocol["criteria_sha256"],
+                                 protocol.get("calibration"), manifest["run_config"]))
+    if results_path is None and not is_current:
+        raise ValueError("active screening is stale; screen the current inputs or explicitly select historical results_path")
+    return workspace, results, judgments, manifest, {"pool": pool, "protocol": protocol,
+        "results_file": results_file, "is_current": is_current}
 
 
 def _exclusion_basis(result: dict, protocol: dict, pool_by_id: dict[str, dict]) -> str:
@@ -123,7 +133,8 @@ def _ris_block(citation: dict, note: str | None) -> str:
     return "\n".join(lines)
 
 
-def _write_ris(path: Path, rows: list[dict], pool_by_id: dict[str, dict], protocol: dict, with_notes: bool) -> None:
+def _write_ris(path: Path, rows: list[dict], pool_by_id: dict[str, dict], protocol: dict, with_notes: bool,
+               history_note: str = "") -> None:
     blocks = []
     for row in rows:
         citation = pool_by_id.get(row["citation_id"])
@@ -134,6 +145,8 @@ def _write_ris(path: Path, rows: list[dict], pool_by_id: dict[str, dict], protoc
             note = f"PANNER screening: excluded ({_exclusion_basis(row, protocol, pool_by_id)})"
         elif with_notes:
             note = f"PANNER screening: {row['status']}; send for further assessment"
+        if history_note:
+            note = f"{note or ''}; {history_note}"
         blocks.append(_ris_block(citation, note))
     path.write_text("\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
 
@@ -185,6 +198,8 @@ def export_screening(workspace_path: str, output_dir: str, results_path: str | N
     summary = workbook.active
     summary.title = "Summary"
     summary_rows = [
+        ("Version context", "current" if context["is_current"] else "historical"),
+        ("Screening version", context["results_file"].parent.name),
         ("Protocol version", manifest.get("protocol_version")),
         ("Protocol sha256", manifest.get("protocol_sha256")),
         ("Citation pool", manifest.get("pool_path")),
@@ -267,11 +282,14 @@ def export_screening(workspace_path: str, output_dir: str, results_path: str | N
     excluded = [row for row in results_sorted if row["status"] == "excluded"]
     retained_path = out / EXPORTS[1]
     excluded_path = out / EXPORTS[2]
-    _write_ris(retained_path, retained, pool_by_id, protocol, with_notes=True)
-    _write_ris(excluded_path, excluded, pool_by_id, protocol, with_notes=True)
+    history_note = (f"PANNER historical screening {context['results_file'].parent.name}; covers its recorded input version"
+                    if not context["is_current"] else "")
+    _write_ris(retained_path, retained, pool_by_id, protocol, with_notes=True, history_note=history_note)
+    _write_ris(excluded_path, excluded, pool_by_id, protocol, with_notes=True, history_note=history_note)
 
     return {
         "status": "exported",
+        "is_current": context["is_current"],
         "workspace_path": str(workspace),
         "output_dir": str(out),
         "files": {name: str(out / name) for name in EXPORTS},

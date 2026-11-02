@@ -13,12 +13,14 @@ import json
 import os
 import random
 import re
+import time
 from pathlib import Path
 
 from .citations import _unique_object
+from .calibration_binding import BINDING_FORMAT, included_labels, judgment_config, optional_hash, validate_binding
 from .evaluate import evaluate_rules
-from .protocol import LABELS_DIR, LABELS_NAME, calibration_report_path, preview_compile
-from .screening import _field_rule_answer, _judge_citation_calibrated, _load_jsonl, load_run_config
+from .protocol import LABELS_DIR, LABELS_NAME, preview_compile
+from .screening import _confirmed_pool, _field_rule_answer, _judge_citation_calibrated, _load_jsonl, load_run_config
 from .workspace import sha256_file, workspace_state
 
 
@@ -73,6 +75,11 @@ def calibrate_compile(
     if not pool_text or not Path(pool_text).is_file():
         raise ValueError("calibration requires the confirmed citation pool of this workspace")
     pool_file = Path(pool_text)
+    pool_manifest = _confirmed_pool(pool_file)
+    citation_file = workspace / state["active_citation"]
+    if (Path(pool_manifest.get("input_path", "")).resolve() != citation_file.resolve()
+            or pool_manifest.get("input_sha256") != sha256_file(citation_file)):
+        raise ValueError("calibration requires the pool derived from the active citations")
     rows = _load_jsonl(pool_file)
     by_id = {row["id"]: row for row in rows}
 
@@ -83,8 +90,21 @@ def calibrate_compile(
             "(one identifier per line: pmid:, doi:, title:, or a source id)"
         )
     labels = [line.strip() for line in labels_file.read_text(encoding="utf-8").split("\n") if line.strip()]
+    declared = workspace / LABELS_DIR / LABELS_NAME
+    if not labels or (declared.is_file() and not included_labels(declared) <= set(labels)):
+        raise ValueError("calibration labels must be nonempty and cover the workspace's declared included set")
 
     config_path, config = load_run_config(run_config_path)
+    binding = {
+        "format": BINDING_FORMAT, "criteria_sha256": preview["criteria_sha256"],
+        "draft_sha256": sha256_file(draft_file), "pool_path": str(pool_file.resolve()),
+        "pool_sha256": sha256_file(pool_file),
+        "pool_manifest_sha256": sha256_file(pool_file.parent / "dedup-manifest.json"),
+        "labels_path": str(labels_file), "labels_sha256": sha256_file(labels_file),
+        "workspace_labels_sha256": optional_hash(declared), "judgment_config": judgment_config(config),
+        "run_config_path": str(config_path),
+    }
+    config_sha256 = sha256_file(config_path)
     api_key = os.environ.get("PANNER_DECISION_API_KEY", "") or os.environ.get("PANNER_LLM_API_KEY", "")
     if config["backend"] == "calibrated" and not api_key:
         raise ValueError("set PANNER_DECISION_API_KEY in the environment; keys never live in the workspace")
@@ -174,6 +194,7 @@ def calibrate_compile(
         }
 
     report = {
+        "binding": binding,
         "status": "calibrated",
         "workspace_path": str(workspace),
         "criteria_version": preview["criteria_version"],
@@ -182,7 +203,7 @@ def calibrate_compile(
         "draft_sha256": sha256_file(draft_file),
         "pool_path": str(pool_file),
         "pool_sha256": sha256_file(pool_file),
-        "run_config_sha256": sha256_file(config_path),
+        "run_config_sha256": config_sha256,
         "model": config["model"],
         "endpoint": config.get("endpoint", ""),
         "labels_path": str(labels_file),
@@ -198,8 +219,14 @@ def calibrate_compile(
         "cost_usd": round(cost, 6),
         "entries": entries,
     }
-    report_file = calibration_report_path(workspace, draft_file)
+    # Validate against the start-of-read inputs, including changes during calls.
+    _, current_state = workspace_state(workspace_path)
+    current_criteria = workspace / current_state["active_eligibility_criteria"]
+    validate_binding(binding, workspace, current_state, sha256_file(current_criteria),
+                     draft_sha256=sha256_file(draft_file))
+    report_file = workspace / "calibration" / f"compile-{binding['draft_sha256'][:12]}-{time.time_ns()}.json"
     report_file.parent.mkdir(parents=True, exist_ok=True)
-    report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with report_file.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     report["report_path"] = str(report_file)
     return report

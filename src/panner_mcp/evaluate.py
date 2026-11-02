@@ -59,25 +59,27 @@ def _answer_lookup(answers: list[dict]):
     return lookup
 
 
-def _disqualifier_value(rule: dict, lookup, arms: list[str]) -> bool | None:
+def _disqualifier_value(rule: dict, lookup, arms: list[str], complete: bool) -> bool | None:
     condition = rule["condition"]
     if rule["unit"] == "record":
         return _condition(condition, lambda signal, on: lookup(signal, "record"))
+    if not arms:
+        return None
     values = [_condition(condition, lambda signal, on, arm=arm: lookup(signal, arm)) for arm in arms]
     if rule["quantifier"] == "any":
         if any(value is True for value in values):
             return True
-        if all(value is False for value in values):
+        if complete and all(value is False for value in values):
             return False
         return None
     if any(value is False for value in values):
         return False
-    if all(value is True for value in values):
+    if complete and all(value is True for value in values):
         return True
     return None
 
 
-def _qualification_value(rule: dict, lookup, arms: list[str]) -> bool | None:
+def _qualification_value(rule: dict, lookup, arms: list[str], complete: bool) -> bool | None:
     condition = rule["condition"]
 
     def for_pair(first: str, second: str) -> bool | None:
@@ -93,7 +95,7 @@ def _qualification_value(rule: dict, lookup, arms: list[str]) -> bool | None:
         return True
     # An empty or partially undetermined enumeration never proves that no
     # qualifying comparison exists.
-    if values and all(value is False for value in values):
+    if complete and values and all(value is False for value in values):
         return False
     return None
 
@@ -107,12 +109,15 @@ def evaluate_rules(rules: list[dict], judgment: dict) -> dict:
     address the record itself.
     """
     arms = list(judgment.get("entities", {}).get("arms", []))
+    # Trial/legacy judgments declare their complete set through arms; live
+    # calibrated judgments additionally record whether that set is reliable.
+    complete = judgment.get("entities", {}).get("complete", True) is True
     lookup = _answer_lookup(judgment.get("answers", []))
     basis: list[dict] = []
     undetermined: list[dict] = []
     for rule in rules:
         if rule["kind"] == "disqualifier":
-            value = _disqualifier_value(rule, lookup, arms)
+            value = _disqualifier_value(rule, lookup, arms, complete)
             if value is True:
                 basis.append(
                     {"rule": rule["id"], "kind": "disqualifier", "reason": "the disqualifying condition is explicitly satisfied"}
@@ -122,7 +127,7 @@ def evaluate_rules(rules: list[dict], judgment: dict) -> dict:
                     {"rule": rule["id"], "reason": "the disqualifying condition is not fully determined by the answers"}
                 )
         else:
-            value = _qualification_value(rule, lookup, arms)
+            value = _qualification_value(rule, lookup, arms, complete)
             if value is True:
                 continue
             if value is False:

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .citations import _unique_object
+from .calibration_binding import optional_hash, validate_binding, verify_frozen_calibration
 from .evaluate import ANSWERS, EXPLICIT, evaluate_rules
 from .workspace import MARKER, sha256_file, workspace_state, write_json_atomic
 
@@ -558,6 +559,9 @@ def preview_compile(workspace_path: str, criteria_path: str, draft_path: str) ->
         "criteria_version": manifest["version"],
         "criteria_sha256": manifest["criteria_sha256"],
         "draft_sha256": sha256_file(draft_file),
+        "labels_sha256": optional_hash(workspace / LABELS_DIR / LABELS_NAME),
+        "pool_sha256": optional_hash(Path(state["active_pool"])) if state.get("active_pool") else None,
+        "calibration_report_sha256": optional_hash(calibration_report_path(workspace, draft_file)),
     }
     plan_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     return {
@@ -584,11 +588,17 @@ CALIBRATION_DIR = "calibration"
 
 
 def calibration_report_path(workspace: Path, draft_file: Path) -> Path:
-    """The calibration report is bound to the draft it judged."""
-    return workspace / CALIBRATION_DIR / f"compile-{sha256_file(draft_file)[:12]}.json"
+    """Select the latest immutable read for this draft, retaining legacy reports."""
+    root = workspace / CALIBRATION_DIR
+    stem = f"compile-{sha256_file(draft_file)[:12]}"
+    candidates = list(root.glob(f"{stem}-*.json"))
+    legacy = root / f"{stem}.json"
+    if legacy.is_file():
+        candidates.append(legacy)
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name)) if candidates else legacy
 
 
-def _require_calibration(workspace: Path, draft_file: Path) -> None:
+def _require_calibration(workspace: Path, draft_file: Path) -> dict | None:
     """A workspace that carries a labeled included set must pass the calibration read before freezing."""
     labels_file = workspace / LABELS_DIR / LABELS_NAME
     report_file = calibration_report_path(workspace, draft_file)
@@ -596,6 +606,12 @@ def _require_calibration(workspace: Path, draft_file: Path) -> None:
         report = json.loads(report_file.read_text(encoding="utf-8"))
         if report.get("draft_sha256") != sha256_file(draft_file):
             raise ValueError("the calibration report belongs to another draft; run the calibration read again")
+        _, state = workspace_state(str(workspace))
+        criteria = workspace / state["active_eligibility_criteria"]
+        validate_binding(report.get("binding"), workspace, state, sha256_file(criteria),
+                         draft_sha256=sha256_file(draft_file))
+        if report.get("status") != "calibrated" or not report.get("mapped") or report.get("unmapped"):
+            raise ValueError("calibration must cover all included labels; resolve unmapped labels and recalibrate")
         excluded = report.get("excluded_labels") or []
         if excluded:
             detail = "; ".join(
@@ -606,7 +622,7 @@ def _require_calibration(workspace: Path, draft_file: Path) -> None:
                 f"the protocol excludes {len(excluded)} of the {report.get('mapped')} labeled included records: {detail}. "
                 "Repair the protocol, or record the user's explicit decision to drop these records."
             )
-        return
+        return report
     if labels_file.is_file():
         raise ValueError(
             f"this workspace carries a labeled included set at {labels_file}; run panner_compile_calibration on this draft "
@@ -623,7 +639,7 @@ def freeze_compile(workspace_path: str, criteria_path: str, draft_path: str, pla
         raise ValueError("the protocol draft changed; show the new preview to the user before confirmation")
     if not user_confirmation.strip():
         raise ValueError("record the user's explicit confirmation of the full preview")
-    _require_calibration(Path(preview["workspace_path"]), Path(draft_path).expanduser().resolve(strict=True))
+    calibration = _require_calibration(Path(preview["workspace_path"]), Path(draft_path).expanduser().resolve(strict=True))
 
     workspace, state = workspace_state(workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -645,11 +661,14 @@ def freeze_compile(workspace_path: str, criteria_path: str, draft_path: str, pla
         "criteria_map": draft["criteria_map"],
         "relevance": draft["relevance"],
         "screening_review": draft["screening_review"],
+        "calibration": calibration["binding"] if calibration else None,
     }
     staging = Path(tempfile.mkdtemp(prefix=".protocol-", dir=protocol_root))
     try:
         protocol_file = staging / PROTOCOL_NAME
         protocol_file.write_text(json.dumps(saved, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if calibration:
+            (staging / "calibration.json").write_text(json.dumps(calibration, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         manifest = {
             "version": version,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -662,6 +681,7 @@ def freeze_compile(workspace_path: str, criteria_path: str, draft_path: str, pla
             "counts": preview["counts"],
             "trial_evaluations": preview["trial_evaluations"],
             "trial_mismatches": preview["trial_mismatches"],
+            "calibration_report_sha256": optional_hash(staging / "calibration.json"),
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(staging, target)
@@ -696,6 +716,7 @@ def protocol_status(workspace_path: str) -> dict:
     if sha256_file(protocol_file) != manifest.get("protocol_sha256"):
         raise ValueError("active protocol differs from its confirmed version")
     protocol = json.loads(protocol_file.read_text(encoding="utf-8"))
+    verify_frozen_calibration(protocol_file, protocol, manifest)
     criteria_relative = state.get("active_eligibility_criteria")
     if not criteria_relative or protocol.get("criteria_sha256") != sha256_file(workspace / criteria_relative):
         raise ValueError("active protocol does not derive from the active criteria")

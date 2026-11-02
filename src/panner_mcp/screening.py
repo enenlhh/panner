@@ -25,6 +25,7 @@ from threading import Event, Lock
 from urllib.parse import urlsplit
 
 from .citations import _unique_object
+from .calibration_binding import validate_binding, verify_frozen_calibration
 from .evaluate import ANSWERS, evaluate_rules
 from .protocol import EVAL_MODES
 from .workspace import MARKER, sha256_file, workspace_state, write_json_atomic
@@ -210,9 +211,15 @@ def load_run_config(path_text: str, *, experimental: bool = False) -> tuple[Path
 
 def _field_rule_answer(signal: dict, citation: dict) -> str:
     rule = signal["field_rule"]
-    values = citation.get(rule["field"]) or []
+    values = citation.get(rule["field"])
+    if values is None:
+        values = []
     if isinstance(values, str):
         values = [values]
+    elif isinstance(values, (int, float)) and not isinstance(values, bool):
+        values = [values]
+    elif not isinstance(values, list):
+        raise ValueError(f"invalid structured field {rule['field']!r}: expected text, number, or list")
     for match in rule["matches"]:
         if any(str(value).strip().casefold() == str(match["value"]).strip().casefold() for value in values):
             return match["answer"]
@@ -263,9 +270,7 @@ def _calibrated_call(config: dict, signals: list[dict], citation: dict, api_key:
     return payload.get("answers", {}), usage
 
 
-def _bound_answer(signal_id: str, on: str, item: object, floor: float | None, flags: list[str]) -> dict:
-    """Bind one model answer to a signal and keep the confidence the decision model reported."""
-    where = signal_id if on == "record" else f"{signal_id} on {on}"
+def _decision_choice(where: str, item: object, choices, floor: float | None, flags: list[str]) -> tuple[str, float | None]:
     raw_confidence = item.get("confidence") if isinstance(item, dict) else None
     confidence = (
         float(raw_confidence)
@@ -273,13 +278,23 @@ def _bound_answer(signal_id: str, on: str, item: object, floor: float | None, fl
         else None
     )
     choice = item.get("choice") if isinstance(item, dict) else None
-    if choice not in ANSWERS:
+    if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
+        flags.append(f"{where}: invalid confidence from the decision model")
+        return "unclear", None
+    if not isinstance(choice, str) or choice not in choices:
         flags.append(f"{where}: no readable choice from the decision model")
         choice = "unclear"
     elif choice != "unclear" and floor is not None and confidence is not None and confidence < floor:
         # A low-confidence answer is not evidence; it stays undetermined rather than excluding.
         flags.append(f"{where}: {choice} below the confidence floor {floor} (confidence {confidence})")
         choice = "unclear"
+    return choice, confidence
+
+
+def _bound_answer(signal_id: str, on: str, item: object, floor: float | None, flags: list[str]) -> dict:
+    """Bind an answer, retaining the confidence reported by the decision model."""
+    where = signal_id if on == "record" else f"{signal_id} on {on}"
+    choice, confidence = _decision_choice(where, item, ANSWERS, floor, flags)
     answer = {"signal": signal_id, "on": on, "answer": choice}
     if confidence is not None:
         answer["confidence"] = confidence
@@ -337,18 +352,23 @@ def _judge_citation_calibrated(config: dict, signals: list[dict], citation: dict
         answers.append(_bound_answer(signal["id"], "record", raw.get(signal["id"]), floor, flags))
     arms = []
     count_choice = None
+    count_confidence = None
+    complete = False
     if group_signals:
         count_item = raw.get(GROUP_COUNT_ID)
         count_choice = count_item.get("choice") if isinstance(count_item, dict) else None
-        if isinstance(count_choice, str) and count_choice.isdigit() and 0 <= int(count_choice) <= MAX_GROUP_SLOTS:
-            arms = [f"group_{number}" for number in range(1, int(count_choice) + 1)]
+        accepted_count, count_confidence = _decision_choice(GROUP_COUNT_ID, count_item, count_criteria, floor, flags)
+        if accepted_count in {str(number) for number in range(MAX_GROUP_SLOTS + 1)}:
+            complete = True
+            arms = [f"group_{number}" for number in range(1, int(accepted_count) + 1)]
         else:
             flags.append("the complete study-group count is unclear; group rules remain undetermined")
         for number, arm in enumerate(arms, 1):
             for signal in group_signals:
                 answers.append(_bound_answer(signal["id"], arm, raw.get(f"{signal['id']}__group_{number}"), floor, flags))
     return {
-        "entities": {"arms": arms, "count_answer": count_choice, "order": "first_mention"},
+        "entities": {"arms": arms, "complete": complete, "count_answer": count_choice,
+                     "count_confidence": count_confidence, "order": "first_mention"},
         "answers": answers, "flags": flags, "usage": usage,
     }
 
@@ -461,6 +481,12 @@ def _plan(workspace_path: str, protocol_path: str, pool_path: str, run_config_pa
     if pool_manifest.get("input_sha256") != sha256_file(workspace / citation_relative):
         raise ValueError("active citations differ from the pool input")
     config_path, config = load_run_config(run_config_path, experimental=experimental)
+    calibration = protocol.get("calibration")
+    if calibration is not None:
+        verify_frozen_calibration(protocol_file, protocol, protocol_manifest)
+        validate_binding(calibration, workspace, state, protocol["criteria_sha256"], config=config)
+    elif (workspace / "labels/included.txt").is_file():
+        raise ValueError("this protocol has no bound calibration for the included set; recalibrate and freeze again")
     screened = _load_jsonl(pool_file)
     screened = [row for row in screened if row["duplicate_of"] is None]
     if config.get("scope") is not None:
@@ -690,12 +716,12 @@ def _execute(plan: dict, api_key: str, user_confirmation: str, progress=None, ca
             if cancel_event is not None and cancel_event.is_set():
                 return None
             judgment = {"entities": {"arms": []}, "answers": [], "flags": [], "usage": {"input": 0, "output": 0, "cost_usd": 0.0}}
-            for signal in field_rules:
-                judgment["answers"].append({"signal": signal["id"], "on": "record", "answer": _field_rule_answer(signal, citation)})
-            deterministic = evaluate_rules(rules, judgment)
             error = None
-            if deterministic["status"] != "excluded_candidate" and semantic:
-                try:
+            try:
+                for signal in field_rules:
+                    judgment["answers"].append({"signal": signal["id"], "on": "record", "answer": _field_rule_answer(signal, citation)})
+                deterministic = evaluate_rules(rules, judgment)
+                if deterministic["status"] != "excluded_candidate" and semantic:
                     if config["backend"] == "calibrated":
                         judged = _judge_citation_calibrated(config, semantic, citation, api_key, reserve_call)
                     else:
@@ -718,12 +744,12 @@ def _execute(plan: dict, api_key: str, user_confirmation: str, progress=None, ca
                     for key in ("response_model", "request_id", "response_provider"):
                         if usage.get(key) is not None:
                             judgment["usage"][key] = usage[key]
-                except CallBudgetExhausted:
-                    return None
-                except Exception as exc:  # noqa: BLE001 - per-citation failure is preserved
-                    error = str(exc)[:300]
-            if error is None:
                 evaluation = evaluate_rules(rules, judgment)
+            except CallBudgetExhausted:
+                return None
+            except Exception as exc:  # noqa: BLE001 - per-citation failure is preserved
+                error = str(exc)[:300]
+            if error is None:
                 result = {
                     "citation_id": citation["id"],
                     "status": "excluded" if evaluation["status"] == "excluded_candidate" else "retained",
@@ -819,6 +845,28 @@ def continue_screen(workspace_path: str, plan_hash: str, *, experimental: bool =
     )
 
 
+def _inputs_are_current(workspace: Path, state: dict, protocol_file: Path, pool_file: Path, criteria_sha256: str,
+                        calibration: dict | None = None, config: dict | None = None) -> bool:
+    """Match a run to the workspace's complete active input chain."""
+    if not all(state.get(key) for key in ("active_protocol", "active_pool", "active_citation", "active_eligibility_criteria")):
+        return False
+    if ((workspace / state["active_protocol"]).resolve() != protocol_file.resolve()
+            or Path(state["active_pool"]).resolve() != pool_file.resolve()
+            or sha256_file(workspace / state["active_eligibility_criteria"]) != criteria_sha256):
+        return False
+    manifest = json.loads((pool_file.parent / "dedup-manifest.json").read_text(encoding="utf-8"))
+    citation = workspace / state["active_citation"]
+    if calibration is not None:
+        try:
+            validate_binding(calibration, workspace, state, criteria_sha256, config=config)
+        except ValueError:
+            return False
+    elif (workspace / "labels/included.txt").is_file():
+        return False
+    return (Path(manifest.get("input_path", "")).resolve() == citation.resolve()
+            and manifest.get("input_sha256") == sha256_file(citation))
+
+
 def screen_status(workspace_path: str) -> dict:
     workspace, state = workspace_state(workspace_path)
     relative = state.get("active_screening")
@@ -872,13 +920,10 @@ def screen_status(workspace_path: str) -> dict:
         if (stored["status"] != expected or stored.get("basis") != evaluated["basis"]
                 or stored.get("undetermined") != evaluated["undetermined"]):
             mismatches.append(judgment["citation_id"])
-    current_protocol = state.get("active_protocol")
-    current_pool = state.get("active_pool")
-    is_current = bool(
-        current_protocol and current_pool
-        and (workspace / current_protocol).resolve() == protocol_file.resolve()
-        and Path(current_pool).resolve() == pool_file.resolve()
-    )
+    verify_frozen_calibration(protocol_file, protocol,
+                              json.loads((protocol_file.parent / "manifest.json").read_text(encoding="utf-8")))
+    is_current = _inputs_are_current(workspace, state, protocol_file, pool_file, protocol["criteria_sha256"],
+                                     protocol.get("calibration"), manifest["run_config"])
     return {
         "status": manifest.get("status", "partial") if is_current else "stale",
         "plan_hash": manifest.get("plan_hash"),

@@ -89,6 +89,10 @@ Results are exported for humans with `panner_screen_export`: a colour-coded `scr
 - every exclusion is auditable end-to-end: status → rule → signal answers → the frozen protocol → the confirmed criteria
 - results are recomputable: given the stored judgments, the shared evaluator reproduces every conclusion
 
+Calibration evidence is bound to the criteria, draft, confirmed pool, complete included-label set, and judgment configuration. Each read is preserved; the frozen protocol saves its calibration snapshot. Refresh the compile preview after calibration. Changed models, endpoints, or confidence floors require a new calibration and protocol version; scheduling and price changes do not. Workspaces without included labels retain the structural-validation path.
+
+Default export covers the current active inputs. Explicit `results_path` selects a saved version; historical exports are labelled in both the report and RIS files.
+
 ## Known limitations (v2.0.0)
 
 - deduplication false-merge/false-split rates are not yet measured on real corpora (BibDedupe results are held open for review whenever identifiers conflict)

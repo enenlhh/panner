@@ -179,7 +179,9 @@
 | `relevance` | `{enabled, facets, note}`；启用时每个 facet 记 `{id, aspect, question}` |
 | `screening_review` | 试读场景列表，每个场景记 `{citation_id, scenario, entities, answers, expected_status, pool?, user_feedback?}`；`pool` 在引用真实池内 citation 时记录其确认版本 |
 
-试读场景中，`entities.arms` 列出该 citation 枚举到的对象名，`answers` 是人工标定的期望回答（`{signal, on, answer}`）；工具按冻结的求值语义逐场景试算并对照 `expected_status`，两者不符时协议保持草稿。场景可以用假设情形检验多组、角色互换、联合措施等结构；引用真实 citation 时从 02 的确认池中选取。协议内容字段的英文要求与用户内容的原文保留同样适用于本表；`clarifications` 是冻结前面向用户的中间产物，不进入冻结协议。草稿整体结构、ID 唯一性、条款覆盖与引文逐字性的完整校验见 [protocol.py 的 `_check_draft`](../src/panner_mcp/protocol.py)；试读试算见 [`_evaluate_trials`](../src/panner_mcp/protocol.py)。
+冻结协议增加 `calibration` 绑定；未声明纳入集且未运行校准时为 null，使用结构与试读验证流程。经过校准的协议版本还包含 `calibration.json` 快照及 manifest 中的快照哈希。
+
+试读场景中，`entities.arms` 列出完整对象范围；`entities.complete: false` 明确表示范围未完备，`answers` 是人工标定的期望回答（`{signal, on, answer}`）；工具按冻结的求值语义逐场景试算并对照 `expected_status`，两者不符时协议保持草稿。场景可以用假设情形检验多组、角色互换、联合措施等结构；引用真实 citation 时从 02 的确认池中选取。协议内容字段的英文要求与用户内容的原文保留同样适用于本表；`clarifications` 是冻结前面向用户的中间产物，不进入冻结协议。草稿整体结构、ID 唯一性、条款覆盖与引文逐字性的完整校验见 [protocol.py 的 `_check_draft`](../src/panner_mcp/protocol.py)；试读试算见 [`_evaluate_trials`](../src/panner_mcp/protocol.py)。
 
 ### 核心信号、读取方式与成本
 
@@ -194,7 +196,7 @@ Panner 提供 `compile_screening_protocol` MCP prompt 作为用户可选的启�
 ```text
 panner_compile_guide() → 编译任务与审阅指引
 panner_compile_preview(workspace_path, criteria_path, draft_path) → 结构与覆盖检查、标准覆盖、待澄清事项、试读试算结果、结构警告和 plan_hash
-panner_compile_calibration(workspace_path, criteria_path, draft_path, run_config_path, labels_path?) → 用草稿协议对综述自带的标注纳入集做判题读数，写出 calibration/compile-<draft_sha256[:12]>.json
+panner_compile_calibration(workspace_path, criteria_path, draft_path, run_config_path, labels_path?) → 用草稿协议对综述自带的标注纳入集做判题读数，写出 calibration/compile-<draft_sha256[:12]>-<read_id>.json
 panner_compile_freeze(workspace_path, criteria_path, draft_path, plan_hash, user_confirmation) → 冻结的 protocol/vN/protocol.json 与 manifest（工作区带标注集时，校准未通过则拒绝冻结）
 panner_compile_status(workspace_path) → 当前冻结协议版本及一致性检查
 ```
@@ -207,13 +209,15 @@ panner_compile_status(workspace_path) → 当前冻结协议版本及一致性�
 
 ### 校准读数：用综述自己的纳入集检验草稿
 
-`screening_review` 的期望答案与期望结论由同一个 agent 撰写，只能检验内部一致性：若 agent 对某条判据的理解本身偏了，试读会与它一起偏。因此工作区可以携带综述自带的纳入清单 `labels/included.txt`（每行一个标识：`pmid:`、`doi:`、`title:`，或来源自带 id），并由 `panner_compile_calibration` 做一次真实读数：用冻结前的草稿协议、按运行配置的判题模型，对标注记录逐条判题并用同一求值器出结论，写出 `calibration/compile-<draft_sha256[:12]>.json`（标签到 citation 的映射、逐条状态、触发规则、回答、调用数与成本）。
+`screening_review` 的期望答案与期望结论由同一个 agent 撰写，只能检验内部一致性：若 agent 对某条判据的理解本身偏了，试读会与它一起偏。因此工作区可以携带综述自带的纳入清单 `labels/included.txt`（每行一个标识：`pmid:`、`doi:`、`title:`，或来源自带 id），并由 `panner_compile_calibration` 做一次真实读数：用冻结前的草稿协议、按运行配置的判题模型，对标注记录逐条判题并用同一求值器出结论，写出 `calibration/compile-<draft_sha256[:12]>-<read_id>.json`（标签到 citation 的映射、逐条状态、触发规则、回答、调用数与成本）。
+
+有效校准绑定标准与草稿哈希、确认池及其 manifest、完整纳入标签集，以及会改变回答的判断配置（后端、提供方、模型、端点、temperature、confidence_floor、judge_channel）。冻结时在 `protocol.json` 保存绑定，并在同目录保存 `calibration.json` 快照及其哈希；筛选与续跑核对当前输入和判断配置。并发、批大小、重试次数与价格属于执行参数，调整这些值不影响校准有效性。每次校准生成独立报告；校准后重新预览，用户确认最新 `plan_hash` 后冻结。已声明纳入集的旧协议或报告缺少有效绑定时，需要重新校准并生成新协议版本；旧产物保留。
 
 判据：
 
 - 工作区存在 `labels/included.txt` 时，**当前草稿没有对应校准报告，冻结被拒绝**；
 - 报告中出现被排除的标注纳入记录时，**冻结被拒绝**，错误里列出该标签与触发规则；
-- 标签在池中找不到时记为 `unmapped`——那是 02 的问题（检索未召回），不是协议缺陷，应向用户报告而不是改协议去迁就。
+- 校准覆盖全部已声明的纳入标签；自定义标签文件须非空且包含 `labels/included.txt` 中的全部标识。标签在池中找不到时记为 `unmapped`，冻结前在 02 核清来源和映射。
 
 校准读数的成本与标注集大小成正比（数十条记录约 $0.01 量级），比跑完整个池再发现误排便宜两个数量级。代价不对称是这一步存在的理由。
 
@@ -279,7 +283,8 @@ panner_compile_status(workspace_path) → 当前冻结协议版本及一致性�
 把少数界定综述主题的正向问题标为 core。core 标记绝不赋予单题排除权；当全部 core 问题保持 unclear 时，citation 被送往主题相关度路由（relevance.facets）而不是被排除，且相关度路由只有在经标注数据验证并随运行配置冻结之后才可排除——否则它只用于为复核排序。若不存在安全的核心题，把 relevance.enabled 设为 false，并在 relevance.note 中说明原因。
 协议内容全部用英文书写——题干、选择条件、facet、handoff 任务与场景描述；在 criterion_refs 与决定记录中原样保留用户的原文。
 从 02 的 citation 池与实际标准中挑选试读场景（明确相关、明确无关、边界、信息缺失、多臂、角色互换、联合用药方案），把期望回答与期望结论写入 screening_review；在判读四值时特别注意 miss 与 unclear 之间、partial 与 unclear 之间的分界。期望答案与期望结论都由你自己撰写，试读只检验内部一致性；综述自带标注纳入集时，池中含有的每条标注记录都必须作为 retained 场景出现，真正检验草稿的是下面的校准读数。
-草稿不能只凭结构就冻结。工作区带有标注纳入集（`labels/included.txt`，每行一个标识：pmid:、doi:、title:，或来源自带 id）时，调用 panner_compile_calibration 并传入运行配置：它用判题模型对标注记录逐条判题，报告规则会排除的每一条。只要有一条标注纳入记录被排除，或当前草稿还没有校准报告，冻结即被拒绝。标签在池中找不到时记为 unmapped，那是 02 的召回问题而非协议缺陷：向用户报告，不要改协议去迁就。
+草稿不能只凭结构就冻结。工作区带有标注纳入集（`labels/included.txt`，每行一个标识：pmid:、doi:、title:，或来源自带 id）时，调用 panner_compile_calibration 并传入运行配置：它用判题模型对标注记录逐条判题，报告规则会排除的每一条。只要有一条标注纳入记录被排除，或当前草稿还没有校准报告，冻结即被拒绝。标签在池中找不到时记为 unmapped，冻结前在 02 核清来源与映射。
+有效校准绑定标准与草稿哈希、确认池及其 manifest、完整纳入标签集，以及会改变回答的判断配置（后端、提供方、模型、端点、temperature、confidence_floor、judge_channel）。冻结时在 `protocol.json` 保存绑定，并在同目录保存 `calibration.json` 快照及其哈希；筛选与续跑核对当前输入和判断配置。并发、批大小、重试次数与价格属于执行参数，调整这些值不影响校准有效性。每次校准生成独立报告；校准后重新预览，用户确认最新 `plan_hash` 后冻结。已声明纳入集的旧协议或报告缺少有效绑定时，需要重新校准并生成新协议版本；旧产物保留。
 调用 panner_compile_preview：解决每一个 issue 与试读不符项——澄清未解决或试读与期望不符时草稿保持草稿——并把信号、规则、标准覆盖、试读结果与每一条警告完整展示给用户。预览会在比较规则带按组否决、或 arms/any disqualifier 排除整条记录时给出警告；警告不是结构错误，但它是冻结前必须回答的问题。
 用户确认协议准确表达了标准后，调用 panner_compile_freeze 并传入确认原话。冻结后，04 只读取该协议执行。
 ```

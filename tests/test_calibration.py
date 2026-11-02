@@ -261,6 +261,7 @@ class CalibrationTests(unittest.TestCase):
         plan = preview_compile(self.workspace, self.criteria, str(self.draft))
         with patch("panner_mcp.calibration._judge_citation_calibrated", side_effect=self.scripted({"C000002"})):
             calibrate_compile(self.workspace, self.criteria, str(self.draft), self.config)
+        plan = preview_compile(self.workspace, self.criteria, str(self.draft))
         with self.assertRaises(ValueError) as caught:
             freeze_compile(self.workspace, self.criteria, str(self.draft), plan["plan_hash"], "确认")
         self.assertIn("pmid:2", str(caught.exception))
@@ -277,6 +278,7 @@ class CalibrationTests(unittest.TestCase):
         with patch("panner_mcp.calibration._judge_citation_calibrated", side_effect=self.scripted(set())):
             report = calibrate_compile(self.workspace, self.criteria, str(self.draft), self.config)
         self.assertEqual(report["excluded"], 0)
+        plan = preview_compile(self.workspace, self.criteria, str(self.draft))
         frozen = freeze_compile(self.workspace, self.criteria, str(self.draft), plan["plan_hash"], "确认")
         self.assertEqual(frozen["status"], "confirmed")
 

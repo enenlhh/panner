@@ -14,7 +14,9 @@
 
 **判题模型的组级题。** 一次判题请求同时提交记录级题、明确组数题，以及按题名摘要首次提及顺序指向第 1 至第 6 组的组级题。只有判题模型明确给出完整组数时，才把相应答案分别记在 `group_1`、`group_2` 等对象上；组数不明或多于六组时，组级答案保持未决，不据组级规则排除。结构题和组级题由同一个低成本判题请求回答，不构成独立的高成本筛选阶段。
 
-**field_rule 匹配语义。** 按冻结模式匹配结构化字段：对 `publication_types` 这类列表字段，模式值为**大小写不敏感的整值相等**，列表中任一元素命中即按该模式作答；不做子串或包含匹配。空值与未匹配值进入 `unclear`，未匹配值不得自动排除。
+判定记录的 `entities` 保存 `arms`、完整性标记 `complete`、原始组数答案 `count_answer` 与 `count_confidence`。若配置了置信度阈值，组数与其他回答适用同一阈值；只有完整且可信的对象范围才能支持“全部组满足排除条件”或“不存在合格比较”的排除。空对象范围保持未决；已有明确对象事实仍可支持任一组规则。试读与旧判定中的 `arms` 列表声明完整对象范围，显式 `complete: false` 表示范围未完备。
+
+**field_rule 匹配语义。** 按冻结模式匹配结构化字段：对 `publication_types` 这类列表字段，模式值为**大小写不敏感的整值相等**，列表中任一元素命中即按该模式作答；不做子串或包含匹配。字符串、整数年份等数值和列表按字段类型统一匹配；空值与未匹配值进入 `unclear`。单条字段读取、判题或规则求值异常记录为 `failed`，其余记录继续处理。
 
 **核心信号聚合。** core 题先汇总同题各对象的已知答案与未决对象，不因某一个组为 `unclear` 就把整题视为 `unclear`。全部核心题仍为 `unclear` 且没有其他排除依据时，该 citation 保留，并在导出中标记 `topic_unclear` 供复核排序。
 
@@ -22,7 +24,7 @@
 
 ### 判断后端与生效条件
 
-正式筛选使用判题模型回答冻结的原子问题，并由确定性求值器计算记录结论。**四值答案的语义本身已含证据性**——只有明确有证据才作答 hit/partial/miss，拿不准即 unclear；生效规则是**排除候选即排除**，不设二次验证、不引入置信度或行为确认：
+正式筛选使用判题模型回答冻结的原子问题，并由确定性求值器计算记录结论。**四值答案的语义本身已含证据性**——只有明确有证据才作答 hit/partial/miss，拿不准即 unclear；生效规则是**排除候选即排除**，不设二次验证；配置了 `confidence_floor` 时先把低置信回答作为 `unclear` 处理：
 
 | 通道 | 适用后端 | 回答形态 |
 |---|---|---|
@@ -30,7 +32,7 @@
 | 确定性事实 | 本地规则 | `field_rule` 信号按冻结模式命中即生效，无随机性 |
 
 已接受的取舍，留痕：判题模型不返回可逐字校验的引文；判定记录保存四值回答，排除依据由回答和冻结规则重算。
-**并发与成本。** 并发为**记录级**：一条 citation 的全部语义信号尽可能在同一请求内回答，默认并发 15。确定性规则已形成排除的记录不调用模型。preview 按未筛数、预设输入输出 token 数及配置单价估算上界，实际调用与费用写入 manifest。
+**并发与成本。** 并发为**记录级**：一条 citation 的全部语义信号尽可能在同一请求内回答，默认并发 30。确定性规则已形成排除的记录不调用模型。preview 按未筛数、预设输入输出 token 数及配置单价估算上界，实际调用与费用写入 manifest。
 
 **失败与恢复。** 单条 citation 的调用失败按配置重试，失败不阻塞其他记录。一个 MCP 调用只处理至多 `batch_size` 条；`cost_cap` 限制该批的 API 请求尝试数，包括重试。事件日志持续保存已完成项，未完成项保持 `pending`；宿主用同一 `plan_hash` 调用 `panner_screen_continue` 处理下一批。
 
@@ -85,6 +87,8 @@ panner_screen_export(workspace_path, output_dir, results_path?) → 三份文件
 | `screening-retained.ris` | 所有未自动排除条目的标准 RIS，包括 retained、pending、failed；notes 注明实际状态；交文献管理软件做后续评估 |
 | `screening-excluded.ris` | 排除条目的标准 RIS，notes 记 Panner 判定（规则 + 条款引文），导入后仍可核对 |
 
+默认导出要求筛选结果对应 workspace 当前活动标准、citation、去重池和协议；输入变化后结果标记为 `stale`，完成当前版本筛选后再默认导出。显式提供 `results_path` 可导出历史版本，工具返回 `is_current`，报告 Summary 与 RIS 备注标明历史状态及筛选版本。
+
 派生视图不引入新事实：题录字段来自确认池的统一结构（原始来源中未映射进 17 字段的信息不回带，如关键词）；续跑获得新判定后可重新导出。
 
 ## MCP 工具与调用契约
@@ -111,6 +115,7 @@ You are running PANNER step 04: screening. Converse with the user in the user's 
 Read the active frozen protocol, the citation pool derived from the active citations, and the calibrated-model run configuration. Only rows with an empty duplicate_of are screened.
 Call panner_screen_preview and show the user the plan: how many citations, how many semantic signals, the model and destination endpoint, the concurrency, the maximum calls, the estimated cost with its basis, and the files to be written. Explain that title and abstract are sent to the configured decision endpoint. Resolve every issue before confirming.
 After the user confirms, call panner_screen_confirm with the same plan_hash. A call processes at most one configured batch. While its result is partial with pending citations, call panner_screen_continue with that plan_hash; the saved confirmation remains valid for this unchanged plan. Failures retry per the config and never block other records. Failed or pending citations remain visible for later assessment.
+Default export requires results for the active inputs. To inspect historical results, pass results_path explicitly; the report and RIS files identify their historical version.
 Show the user the results - excluded with their rule basis, retained with their undetermined reasons, and failed or unfinished with their errors - then call panner_workflow_status to continue.
 ```
 
@@ -119,6 +124,7 @@ Show the user the results - excluded with their rule basis, retained with their 
 读取活动冻结协议、从活动 citation 版本派生的确认池与判题模型运行配置；只筛选 duplicate_of 为空的行。
 调用 panner_screen_preview，向用户说明待筛数、语义信号数、模型与端点、并发、调用上限、成本估算依据及拟写入文件；题名摘要将发送到配置的判题端点。先解决问题再确认。
 用户确认后，以同一 plan_hash 调用 panner_screen_confirm。每次调用最多处理一批；若有 pending，继续调用 panner_screen_continue，不重复征求同一计划的确认。失败按配置重试且不阻塞其他记录；pending 与 failed 始终保留在后续评估交接中。
+默认导出要求结果对应活动输入。查看历史结果时显式提供 results_path，报告与 RIS 标明历史版本。
 向用户说明 excluded 的规则依据、retained 的未决原因、failed 或 pending 的状态，再调用 panner_workflow_status。
 ```
 

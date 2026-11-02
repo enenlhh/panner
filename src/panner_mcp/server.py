@@ -253,7 +253,8 @@ The combination logic is fixed: an explicitly satisfied disqualifier on its conf
 Mark the few topic-defining positive questions core. A core mark never grants a single question the power to exclude; when every core question stays unclear, the citation is retained and marked topic_unclear for review ordering. Keep relevance.facets in the frozen protocol, but this release does not call a relevance backend or exclude through relevance. If no safe core question exists, set relevance.enabled to false and explain why in relevance.note.
 Write all protocol content in English - questions, answer criteria, facets, handoff tasks, and scenario descriptions; keep the user's original wording verbatim in criterion_refs and in decision records.
 Pick trial scenarios from the step 02 citation pool and the actual criteria (clearly relevant, clearly irrelevant, borderline, missing information, multi-arm, swapped roles, combination regimens), write the expected answers and expected outcomes into screening_review, and pay particular attention to the boundaries between miss and unclear, and between partial and unclear, when reading the four values. You author both the answers and the expectations, so a trial read only checks internal consistency; when the review carries a labeled included set, every labeled record the pool contains must appear as a retained scenario, and the calibrated read below is what actually tests the draft against the review.
-A draft is not ready to freeze on structure alone. When the workspace carries a labeled included set (`labels/included.txt`, one identifier per line as pmid:, doi:, title:, or a source id), call panner_compile_calibration with the run configuration: it judges those records with the calibrated model and reports every one the rules would exclude. Freezing is refused while any labeled included record is excluded or while no calibration report exists for the current draft. A label the pool does not contain is reported as unmapped, which is a step 02 finding rather than a protocol defect: report it to the user instead of bending the protocol.
+A draft is not ready to freeze on structure alone. When the workspace carries a labeled included set (`labels/included.txt`, one identifier per line as pmid:, doi:, title:, or a source id), call panner_compile_calibration with the run configuration: it judges those records with the calibrated model and reports every one the rules would exclude. Freezing is refused while any labeled included record is excluded or while no calibration report exists for the current draft. A label the pool does not contain is reported as unmapped; resolve it in step 02 before freezing rather than bending the protocol.
+Calibration validity binds the criteria and draft hashes, the confirmed pool and manifest, the complete included-label set, and the judgment settings (backend, provider, model, endpoint, temperature, confidence floor, and judge channel). Custom labels must be nonempty and include every identifier declared in labels/included.txt. Resolve unmapped labels in step 02 before freezing. Each read writes a new report; freezing saves its binding in protocol.json and a calibration.json snapshot whose hash is in the manifest. Screening and continuation verify that binding against the current inputs and judgment settings. Concurrency, batch size, retry budget, and prices are execution settings and do not invalidate calibration. After calibration, obtain a fresh panner_compile_preview and confirm that plan hash. Legacy evidence without a binding requires recalibration when an included set is declared.
 Call panner_compile_preview: resolve every issue and trial mismatch - the draft stays a draft while clarifications are open or a trial disagrees with its expected outcome - and show the signals, the rules, the criteria coverage, the trial results, and every warning to the user in full. The preview warns when a comparison rule carries per-group vetoes or when an arms/any disqualifier excludes a whole record; a warning is not a schema error, but treat it as a question to answer before freezing.
 After the user confirms that the protocol expresses the criteria accurately, call panner_compile_freeze with the confirmation wording. After freezing, step 04 reads only this protocol.
 """
@@ -322,6 +323,7 @@ class ScreenExportResult(BaseModel):
     output_dir: str
     files: dict[str, str]
     counts: dict[str, int]
+    is_current: bool
 
 
 class ScreenStatusResult(BaseModel):
@@ -585,6 +587,7 @@ Read the active frozen protocol, the citation pool derived from the active citat
 Call panner_screen_preview and show the user the plan: how many citations, how many semantic signals, the model and destination endpoint, the concurrency, the maximum calls, the estimated cost with its basis, and the files to be written. Explain that title and abstract are sent to the configured decision endpoint. Resolve every issue before confirming.
 After the user confirms, call panner_screen_confirm with the same plan_hash. A call processes at most one configured batch. While its result is partial with pending citations, call panner_screen_continue with that plan_hash; the saved confirmation remains valid for this unchanged plan. Failures retry per the config and never block other records. Failed or pending citations remain visible for later assessment.
 Show the user the results - excluded with their rule basis, retained with their undetermined reasons, and failed or unfinished with their errors - then call panner_workflow_status to continue.
+Default export requires results for the active inputs. To inspect historical results, pass results_path explicitly; the report and RIS files identify their historical version.
 """
 
 
@@ -667,7 +670,7 @@ async def panner_screen_continue(
 
 @mcp.tool(annotations=LOCAL_WRITE)
 def panner_screen_export(workspace_path: str, output_dir: str, results_path: str | None = None) -> ScreenExportResult:
-    """Export a colour-coded xlsx report and retained/excluded RIS files from confirmed results."""
+    """Export current results to xlsx and RIS. Default export requires current inputs; explicit results_path selects a version and labels historical exports."""
     try:
         return ScreenExportResult.model_validate(export_screening(workspace_path, output_dir, results_path))
     except (OSError, ValueError) as exc:
